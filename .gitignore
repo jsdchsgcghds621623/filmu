@@ -1,0 +1,11 @@
+# Ignore a specific file
+config.json
+
+# Ignore a whole directory (always include the trailing slash)
+node_modules/
+dist/
+
+# Ignore all files with a specific extension (using wildcards)
+*.log
+*.tmp
+.DS_Store
