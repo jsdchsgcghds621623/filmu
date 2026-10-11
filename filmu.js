@@ -11,6 +11,11 @@ const crypto        = require('crypto');
 const app  = express();
 const PORT = Number(process.env.PORT) || 3000;
 
+// Add this line to trust Render's proxy
+app.set('trust proxy', 1); 
+
+
+
 // ─── Tunables ─────────────────────────────────────────────
 const CAPTURE_TIMEOUT      = Number(process.env.CAPTURE_TIMEOUT)   || 15_000;
 const CAPTURE_CONCURRENCY  = Number(process.env.CAPTURE_CONCURRENCY) || 6;
