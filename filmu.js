@@ -45,6 +45,7 @@ const ALLOWED_ORIGINS = (
     'https://moonflix.website',
     'https://www.moonflix.website',
     'https://player.moonflix.website',
+    'http://localhost:4000',
   ].join(',')
 )
   .split(',')
