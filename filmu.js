@@ -29,12 +29,15 @@ const LOG_LEVEL            = (process.env.LOG_LEVEL  || 'info').toLowerCase();
 const LOG_JSON             = process.env.LOG_JSON === 'true';
 const LOG_COLOR            = process.env.LOG_COLOR !== 'false' && process.stdout.isTTY;
 
-// ─── 24h refresh job tunables ─────────────────────────────
+// ─── Freshness / refresh tunables ─────────────────────────
+// Any DB row older than REFRESH_INTERVAL_MS is considered stale.
+// On-demand requests will refresh it before responding.
 const REFRESH_ENABLED      = process.env.REFRESH_ENABLED !== 'false';
 const REFRESH_INTERVAL_MS  = Number(process.env.REFRESH_INTERVAL_MS) || 24 * 60 * 60_000; // 24h
 const REFRESH_CONCURRENCY  = Number(process.env.REFRESH_CONCURRENCY) || 2;
 const REFRESH_BATCH        = Number(process.env.REFRESH_BATCH)       || 100;
 const REFRESH_BOOT_DELAY   = Number(process.env.REFRESH_BOOT_DELAY)  || 60_000;
+const REFRESH_RETRY_TTL    = Number(process.env.REFRESH_RETRY_TTL)   || 5 * 60_000;        // serve stale 5 min
 const ADMIN_TOKEN          = process.env.ADMIN_TOKEN || '';
 
 // ─── Bingr.one API config ─────────────────────────────────
@@ -172,7 +175,7 @@ function banner() {
     '',
     `${C.cyan}  ╭─────────────────────────────────────────────────────────────╮${C.reset}`,
     `${C.cyan}  │${C.reset}  ${C.bold}🎬  filmu.in stream proxy${C.reset}                                  ${C.cyan}│${C.reset}`,
-    `${C.cyan}  │${C.reset}  ${C.gray}v3.2 · bingr.one · DB-first · 24h auto-refresh${C.reset}          ${C.cyan}│${C.reset}`,
+    `${C.cyan}  │${C.reset}  ${C.gray}v3.3 · bingr.one · DB-first · on-demand 24h refresh${C.reset}     ${C.cyan}│${C.reset}`,
     `${C.cyan}  ╰─────────────────────────────────────────────────────────────╯${C.reset}`,
     '',
   ];
@@ -206,7 +209,7 @@ const corsOptions = {
   credentials: true,
   methods: ['GET', 'HEAD', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Accept', 'Origin', 'X-Requested-With'],
-  exposedHeaders: ['x-cache-source', 'Retry-After'],
+  exposedHeaders: ['x-cache-source', 'x-data-updated-at', 'x-data-stale', 'Retry-After'],
   maxAge: 86_400,
   optionsSuccessStatus: 204,
 };
@@ -324,18 +327,19 @@ async function initDb() {
   log('ok', 'db', 'stream_cache table ready');
 }
 
+// returns { payload, updatedAt } or null
 async function getFromDb(mediaType, tmdb, season, episode) {
   if (!dbReady) return null;
   try {
     const { rows } = await pool.query(
-      `SELECT payload FROM stream_cache
+      `SELECT payload, updated_at FROM stream_cache
        WHERE media_type = $1 AND tmdb = $2 AND season = $3 AND episode = $4
        LIMIT 1`,
       [mediaType, String(tmdb), Number(season), Number(episode)]
     );
     if (!rows.length) return null;
     log('debug', 'db', 'hit', { key: `${mediaType} ${tmdb}|${season}|${episode}` });
-    return rows[0].payload;
+    return { payload: rows[0].payload, updatedAt: rows[0].updated_at };
   } catch (err) {
     log('error', 'db', 'query failed', { err: err.message });
     return null;
@@ -363,7 +367,7 @@ async function saveToDb(mediaType, tmdb, season, episode, payload) {
   }
 }
 
-// ── UPDATE: only used by the 24h refresh job ──────────────
+// ── UPDATE: used by on-demand refresh AND background job ──
 async function updateDb(mediaType, tmdb, season, episode, payload) {
   if (!dbReady) return false;
   const key = `${mediaType} ${tmdb}|${season}|${episode}`;
@@ -385,7 +389,7 @@ async function updateDb(mediaType, tmdb, season, episode, payload) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  LRU CACHE
+//  LRU CACHE  (stores { payload, updatedAt })
 // ═══════════════════════════════════════════════════════════════
 class LRUCache {
   constructor(maxSize) { this.max = maxSize; this.map = new Map(); }
@@ -408,6 +412,20 @@ class LRUCache {
   get size() { return this.map.size; }
 }
 const cache = new LRUCache(MEM_CACHE_MAX);
+
+// memory cache helpers — always carry an updatedAt alongside the payload
+function memSet(key, payload, updatedAt, ttlMs) {
+  cache.set(key, { payload, updatedAt: updatedAt ? toDate(updatedAt) : null }, ttlMs);
+}
+function memGet(key) {
+  return cache.get(key); // { payload, updatedAt } | null
+}
+function toDate(v) {
+  if (!v) return null;
+  if (v instanceof Date) return isNaN(v.getTime()) ? null : v;
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? null : d;
+}
 
 // ═══════════════════════════════════════════════════════════════
 //  SEMAPHORE
@@ -595,8 +613,192 @@ function normalizeBingr(json) {
   return null;
 }
 
+// Build a normalized upstream payload (with available:true, etc.)
+function buildUpstreamPayload(mediaType, cap) {
+  return {
+    available: true,
+    type: mediaType,
+    scraperName: cap.data.scraperName,
+    sources: cap.data.sources,
+    subtitles: cap.data.subtitles,
+    _debug: cap.data._debug,
+    _debugRawKeys: cap.data._debugRawKeys,
+    _debugTrace: cap.data._debugTrace,
+  };
+}
+
+// Fetch upstream, deduped via singleFlight so on-demand requests and the
+// background refresh job never hammer the same content twice concurrently.
+function fetchFreshUpstream(mediaType, tmdb, s, e) {
+  const flightKey = `fetch|${mediaType}|${tmdb}|${s}|${e}`;
+  return singleFlight(flightKey, () =>
+    captureSem.run(() => fetchFromBingr(mediaType, tmdb, s, e))
+  );
+}
+
 // ═══════════════════════════════════════════════════════════════
-//  24H REFRESH JOB — re-fetch upstream, UPDATE existing rows
+//  ON-DEMAND FRESHNESS  → resolveStream()
+//  Flow: memory → DB(fresh|stale) → upstream
+//  A DB row older than REFRESH_INTERVAL_MS is refreshed before responding.
+// ═══════════════════════════════════════════════════════════════
+async function resolveStream(mediaType, tmdb, s, e, key) {
+  // 1) Memory — always fresh (TTL 30 min << 24 h)
+  const mem = memGet(key);
+  if (mem) {
+    return {
+      payload: mem.payload,
+      source: 'memory',
+      negative: mem.payload.available === false,
+      refreshed: false,
+      stale: false,
+      updatedAt: mem.updatedAt,
+    };
+  }
+
+  // 2) DB
+  const dbHit = await getFromDb(mediaType, tmdb, s, e);
+  if (dbHit) {
+    const updatedAt = toDate(dbHit.updatedAt);
+    const ageMs = updatedAt ? Date.now() - updatedAt.getTime() : Infinity;
+    const isStale = !updatedAt || ageMs >= REFRESH_INTERVAL_MS;
+
+    if (!isStale) {
+      log('ok', 'cache', 'db hit (fresh)', {
+        key, ageH: (ageMs / 3_600_000).toFixed(2),
+      });
+      memSet(key, dbHit.payload, updatedAt, CACHE_TTL);
+      return {
+        payload: dbHit.payload,
+        source: 'database',
+        negative: dbHit.payload.available === false,
+        refreshed: false,
+        stale: false,
+        updatedAt,
+      };
+    }
+
+    // STALE → try to refresh from upstream before responding
+    log('info', 'cache', 'db hit (STALE) — refreshing', {
+      key, ageH: (ageMs / 3_600_000).toFixed(2),
+    });
+
+    const cap = await fetchFreshUpstream(mediaType, tmdb, s, e);
+
+    const usable =
+      cap.available &&
+      cap.data &&
+      Array.isArray(cap.data.sources) &&
+      cap.data.sources.length > 0;
+
+    if (usable) {
+      const freshPayload = buildUpstreamPayload(mediaType, cap);
+      const ok = await updateDb(mediaType, tmdb, s, e, freshPayload);
+      if (ok) {
+        const now = new Date();
+        memSet(key, freshPayload, now, CACHE_TTL);
+        log('ok', 'refresh', 'stale row refreshed on-demand', { key });
+        return {
+          payload: freshPayload,
+          source: 'refresh',
+          negative: false,
+          refreshed: true,
+          stale: false,
+          updatedAt: now,
+        };
+      }
+      // updateDb failed → fall through and serve stale
+    }
+
+    // Refresh failed → serve the old payload, mark it stale, short retry TTL
+    log('warn', 'refresh', 'refresh failed — serving stale data', {
+      key,
+      reason: cap.reason || 'db_update_failed',
+    });
+    memSet(key, dbHit.payload, updatedAt, REFRESH_RETRY_TTL);
+    return {
+      payload: dbHit.payload,
+      source: 'database-stale',
+      negative: dbHit.payload.available === false,
+      refreshed: false,
+      stale: true,
+      updatedAt,
+    };
+  }
+
+  // 3) Miss → fetch fresh
+  log('info', 'cache', 'miss — fetching from bingr.one', { key });
+
+  const cap = await fetchFreshUpstream(mediaType, tmdb, s, e);
+
+  if (!cap.available) {
+    const body = {
+      available: false,
+      error: 'Not available',
+      message: 'This movie / episode is not available on this server.',
+      reason: cap.reason,
+      type: mediaType, tmdb, season: s, episode: e,
+    };
+    const now = new Date();
+    memSet(key, body, now, NEGATIVE_CACHE_TTL);
+    return {
+      payload: body,
+      source: 'fetch',
+      negative: true,
+      refreshed: false,
+      stale: false,
+      updatedAt: now,
+    };
+  }
+
+  const payload = buildUpstreamPayload(mediaType, cap);
+  const now = new Date();
+  memSet(key, payload, now, CACHE_TTL);
+  saveToDb(mediaType, tmdb, s, e, payload).catch(() => {});
+
+  return {
+    payload,
+    source: 'fetch',
+    negative: false,
+    refreshed: true,
+    stale: false,
+    updatedAt: now,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  RESPONSE META HELPERS
+// ═══════════════════════════════════════════════════════════════
+function mapCached(source) {
+  if (source === 'memory') return 'memory';
+  if (source === 'database' || source === 'database-stale') return 'database';
+  return false; // 'fetch' or 'refresh' → fresh upstream fetch
+}
+function buildMeta(result) {
+  const updatedAt = toDate(result.updatedAt);
+  const ageSeconds = updatedAt
+    ? Math.max(0, Math.round((Date.now() - updatedAt.getTime()) / 1000))
+    : null;
+  return {
+    source: result.source,
+    refreshed: !!result.refreshed,
+    stale: !!result.stale,
+    updatedAt: updatedAt ? updatedAt.toISOString() : null,
+    ageSeconds,
+    staleAfterHours: +(REFRESH_INTERVAL_MS / 3_600_000).toFixed(2),
+  };
+}
+function buildResponse(result) {
+  return {
+    ...result.payload,
+    _cached: mapCached(result.source),
+    _meta: buildMeta(result),
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  24H BACKGROUND SAFETY SWEEP  (optional, enabled by default)
+//  Keeps never-requested rows fresh. On-demand requests do the
+//  heavy lifting; this just catches the tail.
 // ═══════════════════════════════════════════════════════════════
 const refreshState = {
   running: false,
@@ -608,7 +810,6 @@ const refreshState = {
   lastError: null,
 };
 
-// bounded-concurrency map (keeps us inside captureSem and polite to upstream)
 async function mapLimit(items, limit, fn) {
   const out = new Array(items.length);
   let i = 0;
@@ -635,8 +836,7 @@ async function refreshOne(row) {
 
   let cap;
   try {
-    cap = await captureSem.run(() =>
-      fetchFromBingr(mediaType, tmdb, season, episode));
+    cap = await fetchFreshUpstream(mediaType, tmdb, season, episode);
   } catch (err) {
     log('warn', 'refresh', 'fetch error — keeping old links', { key, err: err.message });
     return false;
@@ -649,18 +849,7 @@ async function refreshOne(row) {
     return false;
   }
 
-  const payload = {
-    available: true,
-    type: mediaType,
-    scraperName: cap.data.scraperName,
-    sources: cap.data.sources,
-    subtitles: cap.data.subtitles,
-    _debug: cap.data._debug,
-    _debugRawKeys: cap.data._debugRawKeys,
-    _debugTrace: cap.data._debugTrace,
-  };
-
-  // never replace good links with an empty / broken result
+  const payload = buildUpstreamPayload(mediaType, cap);
   if (!Array.isArray(payload.sources) || payload.sources.length === 0) {
     log('warn', 'refresh', 'upstream returned 0 sources — keeping old links', { key });
     return false;
@@ -668,7 +857,7 @@ async function refreshOne(row) {
 
   const ok = await updateDb(mediaType, tmdb, season, episode, payload);
   if (ok) {
-    cache.set(key, payload, CACHE_TTL); // keep memory cache in sync
+    memSet(key, payload, new Date(), CACHE_TTL);
     log('ok', 'refresh', 'links updated', {
       key,
       sources: payload.sources.length,
@@ -696,7 +885,6 @@ async function runRefreshCycle() {
   log('info', 'refresh', 'cycle start', { olderThan: cutoff.toISOString() });
 
   try {
-    // keyset pagination: safe even when some rows fail and stay stale
     while (true) {
       const { rows } = await pool.query(
         `SELECT id, media_type, tmdb, season, episode
@@ -739,7 +927,7 @@ let refreshBootTimer = null;
 
 function startRefreshScheduler() {
   if (!REFRESH_ENABLED) {
-    log('info', 'refresh', 'disabled (REFRESH_ENABLED=false)');
+    log('info', 'refresh', 'background sweep disabled (REFRESH_ENABLED=false)');
     return;
   }
   refreshBootTimer = setTimeout(() => runRefreshCycle().catch(() => {}), REFRESH_BOOT_DELAY);
@@ -747,7 +935,7 @@ function startRefreshScheduler() {
   refreshBootTimer.unref?.();
   refreshTimer.unref?.();
 
-  log('info', 'refresh', 'scheduler armed', {
+  log('info', 'refresh', 'background sweep armed', {
     every:       `${(REFRESH_INTERVAL_MS / 3_600_000).toFixed(1)}h`,
     bootDelay:   `${(REFRESH_BOOT_DELAY / 1000).toFixed(0)}s`,
     concurrency: REFRESH_CONCURRENCY,
@@ -764,50 +952,6 @@ function stopRefreshScheduler() {
 // ═══════════════════════════════════════════════════════════════
 //  ROUTES
 // ═══════════════════════════════════════════════════════════════
-async function resolveStream(mediaType, tmdb, s, e, key) {
-  const m2 = cache.get(key);
-  if (m2) return { payload: m2, source: 'memory', negative: m2.available === false };
-
-  const dbHit = await getFromDb(mediaType, tmdb, s, e);
-  if (dbHit) {
-    log('ok', 'cache', 'db hit', { key });
-    cache.set(key, dbHit, CACHE_TTL);
-    return { payload: dbHit, source: 'database', negative: dbHit.available === false };
-  }
-
-  log('info', 'cache', 'miss — fetching from bingr.one', { key });
-
-  const cap = await captureSem.run(() => fetchFromBingr(mediaType, tmdb, s, e));
-
-  if (!cap.available) {
-    const body = {
-      available: false,
-      error: 'Not available',
-      message: 'This movie / episode is not available on this server.',
-      reason: cap.reason,
-      type: mediaType, tmdb, season: s, episode: e,
-    };
-    cache.set(key, body, NEGATIVE_CACHE_TTL);
-    return { payload: body, source: 'fetch', negative: true };
-  }
-
-  const payload = {
-    available: true,
-    type: mediaType,
-    scraperName: cap.data.scraperName,
-    sources: cap.data.sources,
-    subtitles: cap.data.subtitles,
-    _debug: cap.data._debug,
-    _debugRawKeys: cap.data._debugRawKeys,
-    _debugTrace: cap.data._debugTrace,
-  };
-
-  cache.set(key, payload, CACHE_TTL);
-  saveToDb(mediaType, tmdb, s, e, payload).catch(() => {});
-
-  return { payload, source: 'fetch', negative: false };
-}
-
 async function streamHandler(req, res) {
   const tmdb = req.query.tmdb || req.query.id;
   const rawType  = String(req.query.type || '').toLowerCase();
@@ -825,24 +969,20 @@ async function streamHandler(req, res) {
 
   const key = `${mediaType}|${tmdb}|${s}|${e}`;
 
-  const memHit = cache.get(key);
-  if (memHit) {
-    res.setHeader('x-cache-source', 'memory');
-    return res.json({ ...memHit, _cached: 'memory' });
-  }
-
   try {
     const result = await singleFlight(key, () =>
       resolveStream(mediaType, tmdb, s, e, key));
 
+    const meta = buildMeta(result);
     res.setHeader('x-cache-source', result.source);
+    res.setHeader('x-data-stale', meta.stale ? '1' : '0');
+    if (meta.updatedAt) res.setHeader('x-data-updated-at', meta.updatedAt);
 
-    if (result.negative) return res.status(404).json(result.payload);
+    const body = buildResponse(result);
 
-    return res.json({
-      ...result.payload,
-      _cached: result.source === 'fetch' ? false : result.source,
-    });
+    if (result.negative) return res.status(404).json(body);
+    return res.json(body);
+
   } catch (err) {
     if (err.message === 'queue_timeout') {
       res.set('Retry-After', '5');
@@ -866,7 +1006,7 @@ async function streamHandler(req, res) {
 app.get('/api/stream', streamHandler);
 app.get('/api/movie',  streamHandler);
 
-// Manual refresh trigger (protected)
+// Manual full refresh trigger (protected)
 app.post('/api/admin/refresh', async (req, res) => {
   if (!ADMIN_TOKEN) return res.status(404).json({ error: 'Not found' });
 
@@ -897,9 +1037,13 @@ app.get('/health', async (_req, res) => {
     inflight: inflight.size,
     db: dbOk,
     mem: process.memoryUsage().rss,
-    refresh: {
+    freshness: {
+      refreshIntervalHours: +(REFRESH_INTERVAL_MS / 3_600_000).toFixed(2),
+      onDemand: true,
+      retryTtlSeconds: Math.round(REFRESH_RETRY_TTL / 1000),
+    },
+    backgroundSweep: {
       enabled:        REFRESH_ENABLED,
-      everyHours:     +(REFRESH_INTERVAL_MS / 3_600_000).toFixed(2),
       running:        refreshState.running,
       lastStartedAt:  refreshState.lastStartedAt,
       lastFinishedAt: refreshState.lastFinishedAt,
@@ -938,10 +1082,11 @@ let shuttingDown = false;
       bingrSrv: BINGR_SRV,
       bingrScraper: BINGR_SCRAPER,
       refreshEvery: `${(REFRESH_INTERVAL_MS / 3_600_000).toFixed(1)}h`,
+      onDemandRefresh: true,
     });
     log('info', 'server', 'cors allow-list', { hosts: [...ALLOWED_HOSTS].join(', ') });
 
-    // arm the 24h auto-refresh scheduler
+    // arm the optional background safety sweep
     startRefreshScheduler();
 
     log('ready', 'proxy', 'ready — waiting for requests');
