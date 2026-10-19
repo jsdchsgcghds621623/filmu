@@ -12,7 +12,7 @@ const app  = express();
 const PORT = Number(process.env.PORT) || 3000;
 
 // Add this line to trust Render's proxy
-app.set('trust proxy', 1); 
+app.set('trust proxy', 1);
 
 
 
@@ -28,6 +28,14 @@ const RATE_LIMIT_MAX       = Number(process.env.RATE_LIMIT_MAX)    || 120;
 const LOG_LEVEL            = (process.env.LOG_LEVEL  || 'info').toLowerCase();
 const LOG_JSON             = process.env.LOG_JSON === 'true';
 const LOG_COLOR            = process.env.LOG_COLOR !== 'false' && process.stdout.isTTY;
+
+// ─── 24h refresh job tunables ─────────────────────────────
+const REFRESH_ENABLED      = process.env.REFRESH_ENABLED !== 'false';
+const REFRESH_INTERVAL_MS  = Number(process.env.REFRESH_INTERVAL_MS) || 24 * 60 * 60_000; // 24h
+const REFRESH_CONCURRENCY  = Number(process.env.REFRESH_CONCURRENCY) || 2;
+const REFRESH_BATCH        = Number(process.env.REFRESH_BATCH)       || 100;
+const REFRESH_BOOT_DELAY   = Number(process.env.REFRESH_BOOT_DELAY)  || 60_000;
+const ADMIN_TOKEN          = process.env.ADMIN_TOKEN || '';
 
 // ─── Bingr.one API config ─────────────────────────────────
 const BINGR_BASE     = (process.env.BINGR_BASE || 'https://api.bingr.one').replace(/\/+$/, '');
@@ -108,6 +116,7 @@ const TAG_STYLE = {
   http:      { icon: '🌐', color: C.white },
   proxy:     { icon: '🎬', color: C.magenta },
   queue:     { icon: '⏳', color: C.yellow },
+  refresh:   { icon: '♻️ ', color: C.cyan },
   shutdown:  { icon: '🛑', color: C.red },
   ready:     { icon: '✨', color: C.green },
 };
@@ -163,7 +172,7 @@ function banner() {
     '',
     `${C.cyan}  ╭─────────────────────────────────────────────────────────────╮${C.reset}`,
     `${C.cyan}  │${C.reset}  ${C.bold}🎬  filmu.in stream proxy${C.reset}                                  ${C.cyan}│${C.reset}`,
-    `${C.cyan}  │${C.reset}  ${C.gray}v3.1 · bingr.one (POST/GET) · DB-first · never overwrite${C.reset}   ${C.cyan}│${C.reset}`,
+    `${C.cyan}  │${C.reset}  ${C.gray}v3.2 · bingr.one · DB-first · 24h auto-refresh${C.reset}          ${C.cyan}│${C.reset}`,
     `${C.cyan}  ╰─────────────────────────────────────────────────────────────╯${C.reset}`,
     '',
   ];
@@ -308,6 +317,8 @@ async function initDb() {
       ON stream_cache (media_type, tmdb, season, episode);
     CREATE INDEX IF NOT EXISTS idx_stream_cache_lookup
       ON stream_cache (tmdb, season, episode);
+    CREATE INDEX IF NOT EXISTS idx_stream_cache_updated_at
+      ON stream_cache (updated_at);
   `);
   dbReady = true;
   log('ok', 'db', 'stream_cache table ready');
@@ -331,7 +342,7 @@ async function getFromDb(mediaType, tmdb, season, episode) {
   }
 }
 
-// ── INSERT ONLY. Never UPDATE an existing row. ─────────────
+// ── INSERT ONLY. Never UPDATE an existing row here. ───────
 async function saveToDb(mediaType, tmdb, season, episode, payload) {
   if (!dbReady) return;
   const key = `${mediaType} ${tmdb}|${season}|${episode}`;
@@ -349,6 +360,27 @@ async function saveToDb(mediaType, tmdb, season, episode, payload) {
     }
   } catch (err) {
     log('error', 'db', 'save failed', { err: err.message, key });
+  }
+}
+
+// ── UPDATE: only used by the 24h refresh job ──────────────
+async function updateDb(mediaType, tmdb, season, episode, payload) {
+  if (!dbReady) return false;
+  const key = `${mediaType} ${tmdb}|${season}|${episode}`;
+  try {
+    const { rowCount } = await pool.query(
+      `UPDATE stream_cache
+          SET payload = $5::jsonb,
+              updated_at = NOW()
+        WHERE media_type = $1 AND tmdb = $2 AND season = $3 AND episode = $4`,
+      [mediaType, String(tmdb), Number(season), Number(episode), JSON.stringify(payload)]
+    );
+    if (rowCount > 0) log('ok', 'db', 'row refreshed (links replaced)', { key });
+    else              log('debug', 'db', 'refresh target missing', { key });
+    return rowCount > 0;
+  } catch (err) {
+    log('error', 'db', 'update failed', { err: err.message, key });
+    return false;
   }
 }
 
@@ -564,6 +596,172 @@ function normalizeBingr(json) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  24H REFRESH JOB — re-fetch upstream, UPDATE existing rows
+// ═══════════════════════════════════════════════════════════════
+const refreshState = {
+  running: false,
+  lastStartedAt: null,
+  lastFinishedAt: null,
+  lastTotal: 0,
+  lastUpdated: 0,
+  lastFailed: 0,
+  lastError: null,
+};
+
+// bounded-concurrency map (keeps us inside captureSem and polite to upstream)
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let i = 0;
+  const workers = Array.from(
+    { length: Math.min(limit, items.length) },
+    async () => {
+      while (true) {
+        const idx = i++;
+        if (idx >= items.length) return;
+        out[idx] = await fn(items[idx], idx);
+      }
+    }
+  );
+  await Promise.all(workers);
+  return out;
+}
+
+async function refreshOne(row) {
+  const mediaType = row.media_type;
+  const tmdb      = row.tmdb;
+  const season    = Number(row.season);
+  const episode   = Number(row.episode);
+  const key       = `${mediaType}|${tmdb}|${season}|${episode}`;
+
+  let cap;
+  try {
+    cap = await captureSem.run(() =>
+      fetchFromBingr(mediaType, tmdb, season, episode));
+  } catch (err) {
+    log('warn', 'refresh', 'fetch error — keeping old links', { key, err: err.message });
+    return false;
+  }
+
+  if (!cap.available) {
+    log('warn', 'refresh', 'upstream unavailable — keeping old links', {
+      key, reason: cap.reason,
+    });
+    return false;
+  }
+
+  const payload = {
+    available: true,
+    type: mediaType,
+    scraperName: cap.data.scraperName,
+    sources: cap.data.sources,
+    subtitles: cap.data.subtitles,
+    _debug: cap.data._debug,
+    _debugRawKeys: cap.data._debugRawKeys,
+    _debugTrace: cap.data._debugTrace,
+  };
+
+  // never replace good links with an empty / broken result
+  if (!Array.isArray(payload.sources) || payload.sources.length === 0) {
+    log('warn', 'refresh', 'upstream returned 0 sources — keeping old links', { key });
+    return false;
+  }
+
+  const ok = await updateDb(mediaType, tmdb, season, episode, payload);
+  if (ok) {
+    cache.set(key, payload, CACHE_TTL); // keep memory cache in sync
+    log('ok', 'refresh', 'links updated', {
+      key,
+      sources: payload.sources.length,
+      scraper: payload.scraperName,
+    });
+  }
+  return ok;
+}
+
+async function runRefreshCycle() {
+  if (!dbReady) { log('warn', 'refresh', 'skipped — database not ready'); return; }
+  if (refreshState.running) { log('warn', 'refresh', 'cycle already running'); return; }
+
+  refreshState.running       = true;
+  refreshState.lastStartedAt = new Date();
+  refreshState.lastTotal     = 0;
+  refreshState.lastUpdated   = 0;
+  refreshState.lastFailed    = 0;
+  refreshState.lastError     = null;
+
+  const cutoff = new Date(Date.now() - REFRESH_INTERVAL_MS);
+  const t0 = Date.now();
+  let lastId = 0;
+
+  log('info', 'refresh', 'cycle start', { olderThan: cutoff.toISOString() });
+
+  try {
+    // keyset pagination: safe even when some rows fail and stay stale
+    while (true) {
+      const { rows } = await pool.query(
+        `SELECT id, media_type, tmdb, season, episode
+           FROM stream_cache
+          WHERE updated_at < $1
+            AND id > $2
+          ORDER BY id
+          LIMIT $3`,
+        [cutoff, lastId, REFRESH_BATCH]
+      );
+      if (!rows.length) break;
+
+      lastId = rows[rows.length - 1].id;
+      refreshState.lastTotal += rows.length;
+
+      await mapLimit(rows, REFRESH_CONCURRENCY, async (row) => {
+        const ok = await refreshOne(row);
+        if (ok) refreshState.lastUpdated++;
+        else    refreshState.lastFailed++;
+      });
+    }
+
+    log('ok', 'refresh', 'cycle complete', {
+      total:   refreshState.lastTotal,
+      updated: refreshState.lastUpdated,
+      kept:    refreshState.lastFailed,
+      took:    `${((Date.now() - t0) / 1000).toFixed(1)}s`,
+    });
+  } catch (err) {
+    refreshState.lastError = err.message;
+    log('error', 'refresh', 'cycle failed', { err: err.message });
+  } finally {
+    refreshState.running        = false;
+    refreshState.lastFinishedAt = new Date();
+  }
+}
+
+let refreshTimer     = null;
+let refreshBootTimer = null;
+
+function startRefreshScheduler() {
+  if (!REFRESH_ENABLED) {
+    log('info', 'refresh', 'disabled (REFRESH_ENABLED=false)');
+    return;
+  }
+  refreshBootTimer = setTimeout(() => runRefreshCycle().catch(() => {}), REFRESH_BOOT_DELAY);
+  refreshTimer     = setInterval(() => runRefreshCycle().catch(() => {}), REFRESH_INTERVAL_MS);
+  refreshBootTimer.unref?.();
+  refreshTimer.unref?.();
+
+  log('info', 'refresh', 'scheduler armed', {
+    every:       `${(REFRESH_INTERVAL_MS / 3_600_000).toFixed(1)}h`,
+    bootDelay:   `${(REFRESH_BOOT_DELAY / 1000).toFixed(0)}s`,
+    concurrency: REFRESH_CONCURRENCY,
+    batch:       REFRESH_BATCH,
+  });
+}
+
+function stopRefreshScheduler() {
+  if (refreshBootTimer) clearTimeout(refreshBootTimer);
+  if (refreshTimer)     clearInterval(refreshTimer);
+  refreshBootTimer = refreshTimer = null;
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  ROUTES
 // ═══════════════════════════════════════════════════════════════
 async function resolveStream(mediaType, tmdb, s, e, key) {
@@ -668,6 +866,20 @@ async function streamHandler(req, res) {
 app.get('/api/stream', streamHandler);
 app.get('/api/movie',  streamHandler);
 
+// Manual refresh trigger (protected)
+app.post('/api/admin/refresh', async (req, res) => {
+  if (!ADMIN_TOKEN) return res.status(404).json({ error: 'Not found' });
+
+  const token = req.get('x-admin-token') || req.query.token;
+  if (token !== ADMIN_TOKEN) return res.status(401).json({ error: 'Unauthorized' });
+
+  if (refreshState.running) {
+    return res.status(409).json({ ok: false, reason: 'already_running', state: refreshState });
+  }
+  runRefreshCycle().catch(() => {});
+  return res.status(202).json({ ok: true, started: true });
+});
+
 app.get('/health', async (_req, res) => {
   let dbOk = false;
   try {
@@ -685,6 +897,17 @@ app.get('/health', async (_req, res) => {
     inflight: inflight.size,
     db: dbOk,
     mem: process.memoryUsage().rss,
+    refresh: {
+      enabled:        REFRESH_ENABLED,
+      everyHours:     +(REFRESH_INTERVAL_MS / 3_600_000).toFixed(2),
+      running:        refreshState.running,
+      lastStartedAt:  refreshState.lastStartedAt,
+      lastFinishedAt: refreshState.lastFinishedAt,
+      lastTotal:      refreshState.lastTotal,
+      lastUpdated:    refreshState.lastUpdated,
+      lastFailed:     refreshState.lastFailed,
+      lastError:      refreshState.lastError,
+    },
   });
 });
 
@@ -714,8 +937,13 @@ let shuttingDown = false;
       bingrBase: BINGR_BASE,
       bingrSrv: BINGR_SRV,
       bingrScraper: BINGR_SCRAPER,
+      refreshEvery: `${(REFRESH_INTERVAL_MS / 3_600_000).toFixed(1)}h`,
     });
     log('info', 'server', 'cors allow-list', { hosts: [...ALLOWED_HOSTS].join(', ') });
+
+    // arm the 24h auto-refresh scheduler
+    startRefreshScheduler();
+
     log('ready', 'proxy', 'ready — waiting for requests');
     process.stdout.write('\n');
   });
@@ -727,6 +955,8 @@ let shuttingDown = false;
   async function shutdown(sig) {
     if (shuttingDown) return;
     shuttingDown = true;
+    stopRefreshScheduler();
+
     divider(`shutting down (${sig})`);
     log('info', 'shutdown', 'closing HTTP server');
     server.close(() => log('ok', 'shutdown', 'HTTP closed'));
